@@ -26,36 +26,50 @@ export enum States {
   Channel2Off = 7,
 }
 
-// UUID сервисов и характеристик BLE
+// BLE UUID
 const SERVICE_UUID = '0000fff0-0000-1000-8000-00805f9b34fb';
 const CHAR_IDENTIFY = '0000ff02-0000-1000-8000-00805f9b34fb';
 const CHAR_SET_STATE = '0000fff1-0000-1000-8000-00805f9b34fb';
 const CHAR_GET_STATE = '0000fff2-0000-1000-8000-00805f9b34fb';
 
-// Параметры TCP
+// TCP параметры
 const DEVICE_NAME = 'ROOM_7';
 const TCP_HOST = '192.168.1.100';
 const TCP_PORT = 7000;
 const AUTH_TOKEN = 'CM6wqJB5blIMvBKQ';
 
+// Проверка платформы
+const IS_ANDROID_OR_IOS = Platform.OS === 'android' || Platform.OS === 'ios';
+const IS_WEB = Platform.OS === 'web';
+
 export class ControllerService {
   private manager: BleManager | null = null;
   private device: Device | null = null;
-
-  // Флаг — доступен ли BLE на платформе
-  private BLE_ENABLED = Platform.OS === 'ios' || Platform.OS === 'android';
+  private tcpClient: any = null;
+  private BLE_ENABLED = IS_ANDROID_OR_IOS;
 
   constructor() {
     if (this.BLE_ENABLED) {
       this.manager = new BleManager();
+      this.setupBLEListeners();
       console.log('✅ BLE Manager initialized');
     } else {
-      this.manager = null;
-      console.log('⚠️ BLE not supported on this platform, using TCP fallback');
+      console.log('⚠️ BLE disabled or not supported on this platform');
     }
   }
 
-  // Подключение по BLE (если поддерживается)
+  private setupBLEListeners() {
+    if (!this.manager) return;
+
+    this.manager.onStateChange((state) => {
+      console.log(`BLE state changed: ${state}`);
+      if (state === 'PoweredOff') {
+        console.warn('Bluetooth is turned off!');
+      }
+    }, true);
+  }
+
+  // Подключение BLE
   async connectBLE(): Promise<void> {
     if (!this.BLE_ENABLED || !this.manager) {
       throw new Error('BLE не поддерживается на этой платформе');
@@ -63,174 +77,216 @@ export class ControllerService {
 
     console.log('🔄 Scanning for BLE devices...');
     return new Promise((resolve, reject) => {
-      this.manager!.startDeviceScan(null, null, async (error, device) => {
-        if (error) {
-          console.error('❌ BLE Scan Error:', error);
-          reject(error);
-          return;
-        }
+      let scanTimeout: ReturnType<typeof setTimeout>;
 
-        if (device && device.name === DEVICE_NAME) {
-          console.log(`🔗 Found device: ${DEVICE_NAME}`);
-          this.manager!.stopDeviceScan();
-          try {
-            const connected = await device.connect();
-            await connected.discoverAllServicesAndCharacteristics();
-            this.device = connected;
-            console.log('✅ Connected to BLE device.');
-
-            // Отправляем IdentifyRequest
-            await this.writeCharacteristic(CHAR_IDENTIFY, AUTH_TOKEN);
-            console.log('🔑 Authentication successful.');
-            resolve();
-          } catch (e) {
-            console.error('❌ BLE Connection Error:', e);
-            reject(e);
-          }
+      const scanSubscription = this.manager!.onStateChange(async (state) => {
+        if (state === 'PoweredOn') {
+          scanSubscription.remove();
+          this.startDeviceScan(resolve, reject, scanTimeout);
         }
-      });
+      }, true);
+
+      scanTimeout = setTimeout(() => {
+        scanSubscription.remove();
+        this.manager!.stopDeviceScan();
+        reject(new Error('BLE устройство не найдено (timeout)'));
+      }, 15000);
     });
   }
 
-  // Получение состояния по BLE
-  async getStateBLE(): Promise<State> {
-    if (!this.BLE_ENABLED || !this.device) {
-      throw new Error('BLE устройство не подключено или BLE отключен');
-    }
+  private async startDeviceScan(
+    resolve: () => void,
+    reject: (error: Error) => void,
+    scanTimeout: ReturnType<typeof setTimeout>
+  ) {
+    this.manager!.startDeviceScan(null, null, async (error, device) => {
+      if (error) {
+        clearTimeout(scanTimeout);
+        reject(error);
+        return;
+      }
 
-    try {
-      const char = await this.device.readCharacteristicForService(SERVICE_UUID, CHAR_GET_STATE);
-      const data = Buffer.from(char.value!, 'base64');
-      const obj = JSON.parse(data.toString());
+      if (device?.name === DEVICE_NAME) {
+        clearTimeout(scanTimeout);
+        this.manager!.stopDeviceScan();
+        try {
+          const connected = await device.connect();
+          await connected.discoverAllServicesAndCharacteristics();
+          this.device = connected;
+          console.log('✅ Connected to BLE device');
 
-      return {
-        light_on: obj.light_on,
-        door_lock: obj.door_lock,
-        channel_1: obj.channel_1,
-        channel_2: obj.channel_2,
-        temperature: obj.temperature,
-        pressure: obj.pressure,
-        humidity: obj.humidity,
-      };
-    } catch (error) {
-      console.error('❌ Error reading BLE state:', error);
-      throw error;
-    }
+          await this.writeCharacteristic(CHAR_IDENTIFY, AUTH_TOKEN);
+          console.log('🔑 Authentication sent');
+          resolve();
+        } catch (e) {
+          reject(e as Error);
+        }
+      }
+    });
   }
 
-  // Отправка команды по BLE
-  async setStateBLE(state: States): Promise<boolean> {
-    if (!this.BLE_ENABLED || !this.device) {
-      throw new Error('BLE устройство не подключено или BLE отключен');
-    }
-
-    try {
-      const buf = Buffer.from(JSON.stringify({ set_state: state }));
-      await this.device.writeCharacteristicWithResponseForService(
-        SERVICE_UUID,
-        CHAR_SET_STATE,
-        buf.toString('base64')
-      );
-      console.log('📤 Sent BLE state:', state);
-      return true;
-    } catch (error) {
-      console.error('❌ Error setting BLE state:', error);
-      throw error;
-    }
-  }
-
-  // Запись в характеристику BLE (вспомогательная)
   private async writeCharacteristic(charUUID: string, value: string) {
-    if (!this.BLE_ENABLED || !this.device) {
-      throw new Error('BLE устройство не подключено или BLE отключен');
-    }
-
-    const buffer = Buffer.from(value);
+    if (!this.device) throw new Error('BLE устройство не подключено');
+    const buf = Buffer.from(value, 'utf-8');
     await this.device.writeCharacteristicWithResponseForService(
       SERVICE_UUID,
       charUUID,
-      buffer.toString('base64')
+      buf.toString('base64')
     );
   }
 
-  // Получение состояния по TCP (fallback)
-  async getStateTCP(): Promise<State> {
-    console.log('🌐 Fetching state via TCP...');
-    return new Promise((resolve, reject) => {
-      const client = TcpSocket.createConnection({ host: TCP_HOST, port: TCP_PORT }, () => {
-        const msg = { identify: AUTH_TOKEN, get_state: {} };
-        client.write(JSON.stringify(msg));
-      });
+  async getStateBLE(): Promise<State> {
+    if (!this.device) throw new Error('BLE устройство не подключено');
 
-      client.on('data', (data) => {
+    try {
+      const char = await this.device.readCharacteristicForService(
+        SERVICE_UUID,
+        CHAR_GET_STATE
+      );
+
+      if (!char.value) throw new Error('Пустое значение характеристики');
+
+      const data = Buffer.from(char.value, 'base64').toString('utf-8');
+      const obj = JSON.parse(data);
+
+      return this.normalizeState(obj);
+    } catch (error) {
+      console.error('❌ BLE getState error:', error);
+      throw error;
+    }
+  }
+
+  async setStateBLE(state: States): Promise<boolean> {
+    if (!this.device) throw new Error('BLE устройство не подключено');
+
+    try {
+      const payload = JSON.stringify({ set_state: state });
+      await this.writeCharacteristic(CHAR_SET_STATE, payload);
+      console.log('📤 BLE setState sent:', state);
+      return true;
+    } catch (error) {
+      console.error('❌ BLE setState error:', error);
+      throw error;
+    }
+  }
+
+  async getStateTCP(): Promise<State> {
+    if (IS_WEB) {
+      throw new Error('TCP не поддерживается в веб-окружении');
+    }
+
+    console.log('🌐 Connecting via TCP to get state...');
+    return new Promise((resolve, reject) => {
+      const client = TcpSocket.createConnection(
+        { host: TCP_HOST, port: TCP_PORT },
+        () => {
+          const msg = { identify: AUTH_TOKEN, get_state: {} };
+          client.write(JSON.stringify(msg));
+        }
+      );
+
+      const handleError = (err: Error) => {
         client.destroy();
+        reject(err);
+      };
+
+      client.on('data', (data: any) => {
         try {
-          const obj = JSON.parse(data.toString());
-          resolve({
-            light_on: obj.state.light_on,
-            door_lock: obj.state.door_lock,
-            channel_1: obj.state.channel_1,
-            channel_2: obj.state.channel_2,
-            temperature: obj.state.temperature,
-            pressure: obj.state.pressure,
-            humidity: obj.state.humidity,
-          });
+          client.destroy();
+
+          let strData: string;
+          if (typeof data === 'string') {
+            strData = data;
+          } else if (Buffer.isBuffer(data)) {
+            strData = data.toString('utf-8');
+          } else {
+            throw new Error('Неизвестный тип данных в TCP ответе');
+          }
+
+          const obj = JSON.parse(strData);
+          if (!obj.state) {
+            throw new Error('В ответе нет поля state');
+          }
+          resolve(this.normalizeState(obj.state));
         } catch (e) {
-          console.error('❌ TCP Data Parse Error:', e);
-          reject(e);
+          handleError(new Error('Ошибка разбора ответа TCP: ' + (e as Error).message));
         }
       });
 
-      client.on('error', (error) => {
-        console.error('❌ TCP Connection Error:', error);
-        reject(error);
+      client.on('error', (err: Error) => {
+        handleError(new Error('TCP ошибка: ' + err.message));
+      });
+
+      client.on('timeout', () => {
+        handleError(new Error('TCP соединение прервано по таймауту'));
       });
     });
   }
 
-  // Отправка команды по TCP (fallback)
   async setStateTCP(state: States): Promise<boolean> {
-    console.log('🌐 Sending state via TCP...');
+    if (IS_WEB) {
+      throw new Error('TCP не поддерживается в веб-окружении');
+    }
+
+    console.log('🌐 Connecting via TCP to set state...');
     return new Promise((resolve, reject) => {
-      const client = TcpSocket.createConnection({ host: TCP_HOST, port: TCP_PORT }, () => {
-        const msg = { identify: AUTH_TOKEN, set_state: state };
-        client.write(JSON.stringify(msg));
-      });
+      const client = TcpSocket.createConnection(
+        { host: TCP_HOST, port: TCP_PORT },
+        () => {
+          const msg = { identify: AUTH_TOKEN, set_state: state };
+          client.write(JSON.stringify(msg));
+        }
+      );
+
+      const handleError = (err: Error) => {
+        client.destroy();
+        reject(err);
+      };
 
       client.on('data', () => {
         client.destroy();
-        console.log('📤 Sent TCP state:', state);
         resolve(true);
       });
 
-      client.on('error', (error) => {
-        console.error('❌ TCP Connection Error:', error);
-        reject(error);
+      client.on('error', (err: Error) => {
+        handleError(new Error('TCP ошибка: ' + err.message));
+      });
+
+      client.on('timeout', () => {
+        handleError(new Error('TCP соединение прервано по таймауту'));
       });
     });
   }
 
-  // Удобный метод: получить состояние — сначала через BLE, иначе через TCP
-  async getState(): Promise<State> {
-    if (this.BLE_ENABLED) {
-      try {
-        return await this.getStateBLE();
-      } catch (e) {
-        console.warn('⚠️ BLE getState failed, fallback to TCP', e);
-      }
-    }
-    return this.getStateTCP();
+  private normalizeState(obj: any): State {
+    return {
+      light_on: Boolean(obj.light_on),
+      door_lock: Boolean(obj.door_lock),
+      channel_1: Boolean(obj.channel_1),
+      channel_2: Boolean(obj.channel_2),
+      temperature: Number(obj.temperature) || 0,
+      pressure: Number(obj.pressure) || 0,
+      humidity: Number(obj.humidity) || 0,
+    };
   }
 
-  // Удобный метод: отправить состояние — сначала через BLE, иначе через TCP
-  async setState(state: States): Promise<boolean> {
-    if (this.BLE_ENABLED) {
+  async disconnectBLE(): Promise<void> {
+    if (this.device) {
       try {
-        return await this.setStateBLE(state);
+        await this.device.cancelConnection();
+        this.device = null;
+        console.log('✅ BLE device disconnected');
       } catch (e) {
-        console.warn('⚠️ BLE setState failed, fallback to TCP', e);
+        console.warn('⚠️ Ошибка при отключении BLE:', e);
       }
     }
-    return this.setStateTCP(state);
+  }
+
+  async cleanup() {
+    await this.disconnectBLE();
+    if (this.manager) {
+      this.manager.destroy();
+      this.manager = null;
+    }
   }
 }
